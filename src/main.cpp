@@ -34,6 +34,7 @@
 
 // IMU sampling
 #define SAMPLE_INTERVAL 20UL
+#define SLEEP_SAMPLE_INTERVAL 100UL
 
 // OLED animation
 #define FRAME_INTERVAL 33UL
@@ -58,6 +59,26 @@
 
 #define CALIBRATION_DURATION 2000UL
 
+// Inactivity
+#define SLEEPY_TIMEOUT 60000UL
+#define INACTIVITY_TIMEOUT 180000UL
+
+// Sleep animation before OLED turns off
+#define SLEEP_TRANSITION_DURATION 1800UL
+
+// Movement detection thresholds
+#define MOVEMENT_ACCEL_THRESHOLD 0.10f
+#define MOVEMENT_GYRO_THRESHOLD 8.0f
+
+// Other expression timings
+#define DIZZY_DURATION 2500UL
+#define ANNOYED_DURATION 1800UL
+#define CURIOUS_DURATION 2000UL
+
+// Repeated bump detection
+#define BUMP_WINDOW 8000UL
+#define REPEATED_BUMP_COUNT 3
+
 
 // ============================================================
 // HARDWARE
@@ -81,7 +102,12 @@ enum FaceMood
     MOOD_TURN_LEFT,
     MOOD_TURN_RIGHT,
     MOOD_BUMP,
-    MOOD_PICKED_UP
+    MOOD_PICKED_UP,
+    MOOD_DIZZY,
+    MOOD_SLEEPY,
+    MOOD_SLEEPING,
+    MOOD_ANNOYED,
+    MOOD_CURIOUS
 };
 
 FaceMood mood = MOOD_IDLE;
@@ -95,7 +121,6 @@ unsigned long lastSampleMillis = 0;
 unsigned long lastFrameMillis = 0;
 
 unsigned long lastBumpMillis = 0;
-
 unsigned long moodUntil = 0;
 
 unsigned long tiltStartMillis = 0;
@@ -105,6 +130,21 @@ unsigned long turnReleaseMillis = 0;
 
 unsigned long nextBlinkMillis = 0;
 unsigned long blinkUntil = 0;
+
+unsigned long lastMovementMillis = 0;
+
+unsigned long sleepTransitionStart = 0;
+
+unsigned long bumpWindowStart = 0;
+unsigned long nextCuriousMillis = 0;
+
+
+// ============================================================
+// POWER SAVING STATE
+// ============================================================
+
+bool displaySleeping = false;
+bool sleepTransition = false;
 
 
 // ============================================================
@@ -121,14 +161,12 @@ float gyroZ = 0;
 
 float accelMagnitude = 0;
 float linearMagnitude = 0;
+float gyroMagnitude = 0;
 
 
 // ============================================================
 // GRAVITY REFERENCE
 // ============================================================
-
-// Low-pass filtered gravity estimate.
-// Used to separate sudden acceleration from gravity.
 
 float gravityX = 0;
 float gravityY = 0;
@@ -160,6 +198,8 @@ bool pickedUp = false;
 bool turning = false;
 
 int turnDirection = 0;
+
+int recentBumpCount = 0;
 
 
 // ============================================================
@@ -231,9 +271,84 @@ void calibrateIMU()
 
         calibrated = true;
 
+        lastMovementMillis = millis();
+
+        nextCuriousMillis =
+            millis() + random(15000, 30000);
+
         #if SERIAL_DEBUG
         Serial.println("IMU calibration complete");
         #endif
+    }
+}
+
+
+// ============================================================
+// DISPLAY POWER MANAGEMENT
+// ============================================================
+
+void enterPowerSaving()
+{
+    if (displaySleeping)
+        return;
+
+    u8g2.setPowerSave(1);
+
+    displaySleeping = true;
+}
+
+
+void wakeDisplay()
+{
+    if (displaySleeping)
+    {
+        u8g2.setPowerSave(0);
+        displaySleeping = false;
+    }
+
+    sleepTransition = false;
+
+    lastFrameMillis = 0;
+
+    blinkUntil = 0;
+    nextBlinkMillis = millis() + 2500;
+
+    lastMovementMillis = millis();
+
+    mood = MOOD_IDLE;
+}
+
+
+// ============================================================
+// MOVEMENT DETECTION
+// ============================================================
+
+void detectMovement()
+{
+    if (!calibrated)
+        return;
+
+    bool accelerationDetected =
+        linearMagnitude > MOVEMENT_ACCEL_THRESHOLD;
+
+    bool rotationDetected =
+        gyroMagnitude > MOVEMENT_GYRO_THRESHOLD;
+
+    if (accelerationDetected || rotationDetected)
+    {
+        lastMovementMillis = millis();
+
+        // Wake up if the OLED was switched off
+        if (displaySleeping || sleepTransition)
+        {
+            wakeDisplay();
+        }
+
+        // Leave sleepy state when movement resumes
+        if (mood == MOOD_SLEEPY)
+        {
+            mood = MOOD_IDLE;
+        }
     }
 }
 
@@ -258,7 +373,12 @@ void readIMU()
         accelZ
     );
 
-    // Initialise gravity estimate
+    gyroMagnitude = vectorMagnitude(
+        gyroX,
+        gyroY,
+        gyroZ
+    );
+
     if (!gravityInitialized)
     {
         gravityX = accelX;
@@ -322,9 +442,12 @@ void detectPickup()
             {
                 pickedUp = true;
 
+                wakeDisplay();
+
                 mood = MOOD_PICKED_UP;
 
                 tiltStartMillis = 0;
+                moodUntil = 0;
             }
         }
         else
@@ -334,8 +457,8 @@ void detectPickup()
     }
     else
     {
-        // Release only after the robot returns
-        // close to its original orientation.
+        // Release only after returning close
+        // to the original orientation.
 
         if (tilt < PICKUP_RELEASE_THRESHOLD &&
             accelMagnitude > 0.85f &&
@@ -351,7 +474,10 @@ void detectPickup()
 
                 pickupReleaseMillis = 0;
 
-                mood = MOOD_IDLE;
+                lastMovementMillis = now;
+
+                mood = MOOD_DIZZY;
+                moodUntil = now + DIZZY_DURATION;
             }
         }
         else
@@ -379,9 +505,31 @@ void detectBump()
         {
             lastBumpMillis = now;
 
-            mood = MOOD_BUMP;
+            wakeDisplay();
 
-            moodUntil = now + BUMP_DURATION;
+            // Count bumps within a time window
+            if (bumpWindowStart == 0 ||
+                now - bumpWindowStart > BUMP_WINDOW)
+            {
+                bumpWindowStart = now;
+                recentBumpCount = 0;
+            }
+
+            recentBumpCount++;
+
+            if (recentBumpCount >= REPEATED_BUMP_COUNT)
+            {
+                mood = MOOD_ANNOYED;
+                moodUntil = now + ANNOYED_DURATION;
+
+                recentBumpCount = 0;
+                bumpWindowStart = 0;
+            }
+            else
+            {
+                mood = MOOD_BUMP;
+                moodUntil = now + BUMP_DURATION;
+            }
         }
     }
 }
@@ -406,9 +554,12 @@ void detectTurning()
 
         turnReleaseMillis = 0;
 
-        // Don't override a bump animation
-        if (mood != MOOD_BUMP ||
-            now >= moodUntil)
+        wakeDisplay();
+
+        // Don't override higher-priority expressions
+        if (mood == MOOD_IDLE ||
+            mood == MOOD_TURN_LEFT ||
+            mood == MOOD_TURN_RIGHT)
         {
             mood = (turnDirection > 0)
                 ? MOOD_TURN_RIGHT
@@ -450,6 +601,8 @@ void updateSensors()
 {
     readIMU();
 
+    detectMovement();
+
     detectPickup();
 
     if (pickedUp)
@@ -458,6 +611,114 @@ void updateSensors()
     detectBump();
 
     detectTurning();
+}
+
+
+// ============================================================
+// POWER SAVING / INACTIVITY EXPRESSIONS
+// ============================================================
+
+void updatePowerSaving()
+{
+    if (!calibrated)
+        return;
+
+    if (pickedUp || turning)
+        return;
+
+    unsigned long now = millis();
+
+    unsigned long inactiveTime =
+        now - lastMovementMillis;
+
+    // --------------------------------------------------------
+    // Sleep transition
+    // --------------------------------------------------------
+
+    if (inactiveTime >= INACTIVITY_TIMEOUT)
+    {
+        if (!sleepTransition && !displaySleeping)
+        {
+            sleepTransition = true;
+            sleepTransitionStart = now;
+
+            mood = MOOD_SLEEPING;
+
+            // Allow the Z animation to begin
+            lastFrameMillis = 0;
+        }
+
+        if (sleepTransition &&
+            now - sleepTransitionStart >=
+            SLEEP_TRANSITION_DURATION)
+        {
+            enterPowerSaving();
+        }
+
+        return;
+    }
+
+    // --------------------------------------------------------
+    // Sleepy expression
+    // --------------------------------------------------------
+
+    if (!displaySleeping &&
+        !sleepTransition &&
+        inactiveTime >= SLEEPY_TIMEOUT)
+    {
+        if (mood == MOOD_IDLE)
+        {
+            mood = MOOD_SLEEPY;
+        }
+    }
+}
+
+
+// ============================================================
+// UPDATE TEMPORARY EXPRESSIONS
+// ============================================================
+
+void updateTimedExpressions()
+{
+    unsigned long now = millis();
+
+    // End temporary expressions
+    if ((mood == MOOD_BUMP ||
+         mood == MOOD_ANNOYED ||
+         mood == MOOD_DIZZY ||
+         mood == MOOD_CURIOUS) &&
+        now >= moodUntil)
+    {
+        if (turning)
+        {
+            mood = (turnDirection > 0)
+                ? MOOD_TURN_RIGHT
+                : MOOD_TURN_LEFT;
+        }
+        else
+        {
+            mood = MOOD_IDLE;
+        }
+    }
+
+    // Don't introduce random expressions
+    // while another event is active.
+    if (mood != MOOD_IDLE || turning || pickedUp)
+        return;
+
+    // --------------------------------------------------------
+    // Random curious expression
+    // --------------------------------------------------------
+
+    if (now >= nextCuriousMillis)
+    {
+        mood = MOOD_CURIOUS;
+
+        moodUntil = now + CURIOUS_DURATION;
+
+        nextCuriousMillis =
+            now + random(20000, 40000);
+    }
 }
 
 
@@ -474,7 +735,8 @@ void updateBlink()
     {
         blinkUntil = now + 340;
 
-        nextBlinkMillis = now + random(6000,12000);
+        nextBlinkMillis =
+            now + random(6000, 12000);
     }
 
     if (blinkUntil != 0 && now >= blinkUntil)
@@ -485,7 +747,7 @@ void updateBlink()
 
 
 // ============================================================
-// DRAW FACE
+// DRAW EYES
 // ============================================================
 
 void drawEyes(
@@ -514,6 +776,10 @@ void drawEyes(
 }
 
 
+// ============================================================
+// MOUTH EXPRESSIONS
+// ============================================================
+
 void drawSmile()
 {
     u8g2.drawLine(59, 51, 64, 54);
@@ -521,21 +787,237 @@ void drawSmile()
 }
 
 
+void drawBigSmile()
+{
+    u8g2.drawLine(55, 49, 60, 55);
+    u8g2.drawLine(60, 55, 64, 57);
+    u8g2.drawLine(64, 57, 68, 55);
+    u8g2.drawLine(68, 55, 73, 49);
+}
+
+
+void drawFlatMouth()
+{
+    u8g2.drawLine(58, 53, 70, 53);
+}
+
+
+void drawSadMouth()
+{
+    u8g2.drawLine(58, 56, 64, 51);
+    u8g2.drawLine(64, 51, 70, 56);
+}
+
+
 void drawSurprisedMouth()
 {
-    u8g2.drawCircle(64, 52, 4);
+    u8g2.drawDisc(64, 53, 7);
+
+    u8g2.setDrawColor(0);
+    u8g2.drawDisc(64, 53, 3);
+    u8g2.setDrawColor(1);
 }
+
+
+// ============================================================
+// CLOSED EYES
+// ============================================================
 
 void drawClosedEyes()
 {
-    // Left closed eye
     u8g2.drawLine(34, 31, 40, 27);
     u8g2.drawLine(40, 27, 46, 31);
 
-    // Right closed eye
     u8g2.drawLine(72, 31, 78, 27);
     u8g2.drawLine(78, 27, 84, 31);
 }
+
+
+// ============================================================
+// SLEEPY EYES
+// ============================================================
+
+void drawSleepyEyes()
+{
+    // Same rectangular eye design,
+    // partially closed from the top.
+
+    u8g2.drawRBox(34, 30, 22, 12, 5);
+    u8g2.drawRBox(72, 30, 22, 12, 5);
+
+    // Eyelid lines
+    u8g2.drawLine(34, 30, 56, 30);
+    u8g2.drawLine(72, 30, 94, 30);
+}
+
+
+// ============================================================
+// SURPRISED EXPRESSION
+// ============================================================
+
+void drawSurprisedFace()
+{
+    // Keep the original rectangular eyes.
+    // Make them taller to show surprise.
+
+    drawEyes(
+        33,
+        71,
+        12,
+        24,
+        32
+    );
+
+    // Raised eyebrows
+    u8g2.drawLine(34, 7, 45, 4);
+    u8g2.drawLine(83, 4, 94, 7);
+
+    drawSurprisedMouth();
+}
+
+
+// ============================================================
+// EXCITED EXPRESSION
+// ============================================================
+
+void drawExcitedFace()
+{
+    drawEyes(
+        33,
+        71,
+        12,
+        24,
+        29
+    );
+
+    // Happy eyebrows
+    u8g2.drawLine(35, 9, 46, 5);
+    u8g2.drawLine(82, 5, 93, 9);
+
+    drawBigSmile();
+
+    // Small excitement marks
+    u8g2.drawLine(21, 18, 17, 14);
+    u8g2.drawLine(107, 18, 111, 14);
+}
+
+
+// ============================================================
+// DIZZY EXPRESSION
+// ============================================================
+
+void drawDizzyFace()
+{
+    // Keep rectangular eye outlines.
+    drawEyes(
+        34,
+        72,
+        17,
+        22,
+        26
+    );
+
+    // Cross-shaped pupils
+    u8g2.setDrawColor(0);
+
+    u8g2.drawLine(39, 24, 51, 36);
+    u8g2.drawLine(51, 24, 39, 36);
+
+    u8g2.drawLine(77, 24, 89, 36);
+    u8g2.drawLine(89, 24, 77, 36);
+
+    u8g2.setDrawColor(1);
+
+    drawSurprisedMouth();
+
+    // Animated dizzy marks
+    unsigned long phase = millis() / 180;
+
+    int offset = (phase % 2 == 0) ? 0 : 3;
+
+    u8g2.setFont(u8g2_font_6x10_tr);
+    u8g2.drawStr(16 + offset, 15, "*");
+    u8g2.drawStr(101 - offset, 15, "*");
+}
+
+
+// ============================================================
+// ANNOYED EXPRESSION
+// ============================================================
+
+void drawAnnoyedFace()
+{
+    drawEyes(
+        34,
+        72,
+        19,
+        22,
+        24
+    );
+
+    // Angry eyebrows
+    u8g2.drawLine(32, 12, 56, 20);
+    u8g2.drawLine(72, 20, 96, 12);
+
+    drawSadMouth();
+}
+
+
+// ============================================================
+// CURIOUS EXPRESSION
+// ============================================================
+
+void drawCuriousFace()
+{
+    unsigned long phase = millis() / 350;
+
+    int offset = (phase % 2 == 0) ? 3 : 0;
+
+    // Eyes shift slightly to the right.
+    drawEyes(
+        34 + offset,
+        72 + offset,
+        17,
+        22,
+        26
+    );
+
+    // One raised eyebrow
+    u8g2.drawLine(34, 8, 48, 5);
+
+    // Other eyebrow raised differently
+    u8g2.drawLine(78, 7, 94, 12);
+
+    drawFlatMouth();
+}
+
+
+// ============================================================
+// SLEEPING EXPRESSION
+// ============================================================
+
+void drawSleepingFace()
+{
+    drawClosedEyes();
+
+    drawFlatMouth();
+
+    // Animated Zs
+    unsigned long phase = millis() / 350;
+
+    int x = 88 - (phase % 3) * 4;
+    int y = 25 - (phase % 3) * 8;
+
+    u8g2.setFont(u8g2_font_6x10_tr);
+
+    u8g2.drawStr(x, y, "Z");
+    u8g2.drawStr(x + 10, y - 10, "Z");
+}
+
+
+// ============================================================
+// DRAW FACE
+// ============================================================
 
 void drawFace()
 {
@@ -543,23 +1025,11 @@ void drawFace()
 
     u8g2.clearBuffer();
 
-    // --------------------------------------------------------
-    // Default face positioning
-    // --------------------------------------------------------
-
-    int leftX = 34;
-    int rightX = 72;
-
-    int eyeY = 17;
-
-    int eyeWidth = 22;
-    int eyeHeight = 26;
-
     bool blink =
         (blinkUntil != 0 && now < blinkUntil);
 
     // --------------------------------------------------------
-    // Normal expression
+    // Normal / happy
     // --------------------------------------------------------
 
     if (mood == MOOD_IDLE)
@@ -571,11 +1041,11 @@ void drawFace()
         else
         {
             drawEyes(
-                leftX,
-                rightX,
-                eyeY,
-                eyeWidth,
-                eyeHeight
+                34,
+                72,
+                17,
+                22,
+                26
             );
         }
 
@@ -589,11 +1059,11 @@ void drawFace()
     else if (mood == MOOD_TURN_LEFT)
     {
         drawEyes(
-            leftX - 5,
-            rightX - 5,
-            eyeY,
-            eyeWidth,
-            eyeHeight
+            29,
+            67,
+            17,
+            22,
+            26
         );
 
         drawSmile();
@@ -606,52 +1076,82 @@ void drawFace()
     else if (mood == MOOD_TURN_RIGHT)
     {
         drawEyes(
-            leftX + 5,
-            rightX + 5,
-            eyeY,
-            eyeWidth,
-            eyeHeight
+            39,
+            77,
+            17,
+            22,
+            26
         );
 
         drawSmile();
     }
 
     // --------------------------------------------------------
-    // Bump / startled
+    // Surprised / bump
     // --------------------------------------------------------
 
     else if (mood == MOOD_BUMP)
     {
-        drawEyes(
-            31,
-            75,
-            13,
-            25,
-            30
-        );
-
-        drawSurprisedMouth();
+        drawSurprisedFace();
     }
 
     // --------------------------------------------------------
-    // Picked up
+    // Excited / picked up
     // --------------------------------------------------------
 
     else if (mood == MOOD_PICKED_UP)
     {
-        drawEyes(
-            34,
-            72,
-            13,
-            22,
-            25
-        );
+        drawExcitedFace();
+    }
 
-        // Happy eyebrows
-        u8g2.drawLine(35, 9, 46, 6);
-        u8g2.drawLine(82, 6, 93, 9);
+    // --------------------------------------------------------
+    // Dizzy
+    // --------------------------------------------------------
 
-        drawSmile();
+    else if (mood == MOOD_DIZZY)
+    {
+        drawDizzyFace();
+    }
+
+    // --------------------------------------------------------
+    // Sleepy
+    // --------------------------------------------------------
+
+    else if (mood == MOOD_SLEEPY)
+    {
+        drawSleepyEyes();
+
+        drawFlatMouth();
+
+        u8g2.setFont(u8g2_font_6x10_tr);
+        u8g2.drawStr(96, 17, "z");
+    }
+
+    // --------------------------------------------------------
+    // Sleeping
+    // --------------------------------------------------------
+
+    else if (mood == MOOD_SLEEPING)
+    {
+        drawSleepingFace();
+    }
+
+    // --------------------------------------------------------
+    // Annoyed
+    // --------------------------------------------------------
+
+    else if (mood == MOOD_ANNOYED)
+    {
+        drawAnnoyedFace();
+    }
+
+    // --------------------------------------------------------
+    // Curious
+    // --------------------------------------------------------
+
+    else if (mood == MOOD_CURIOUS)
+    {
+        drawCuriousFace();
     }
 
     u8g2.sendBuffer();
@@ -698,6 +1198,8 @@ void setup()
     Serial.begin(115200);
     #endif
 
+    randomSeed(micros());
+
     Wire.begin(I2C_SDA, I2C_SCL);
     Wire.setClock(100000);
 
@@ -742,7 +1244,12 @@ void loop()
     // IMU sampling
     // --------------------------------------------------------
 
-    if (now - lastSampleMillis >= SAMPLE_INTERVAL)
+    unsigned long currentSampleInterval =
+        displaySleeping
+        ? SLEEP_SAMPLE_INTERVAL
+        : SAMPLE_INTERVAL;
+
+    if (now - lastSampleMillis >= currentSampleInterval)
     {
         lastSampleMillis = now;
 
@@ -766,7 +1273,7 @@ void loop()
     }
 
     // --------------------------------------------------------
-    // Display calibration screen
+    // Calibration screen
     // --------------------------------------------------------
 
     if (!calibrated)
@@ -782,24 +1289,33 @@ void loop()
     }
 
     // --------------------------------------------------------
-    // Return to idle after bump animation
+    // Power saving and inactivity
     // --------------------------------------------------------
 
-    if (mood == MOOD_BUMP &&
-        now >= moodUntil)
+    updatePowerSaving();
+
+    // Do not render while OLED is switched off
+    if (displaySleeping)
+        return;
+
+    // --------------------------------------------------------
+    // Temporary expression handling
+    // --------------------------------------------------------
+
+    updateTimedExpressions();
+
+    // --------------------------------------------------------
+    // Animation updates
+    // --------------------------------------------------------
+
+    if (mood == MOOD_IDLE)
     {
-        mood = turning
-            ? ((turnDirection > 0)
-                ? MOOD_TURN_RIGHT
-                : MOOD_TURN_LEFT)
-            : MOOD_IDLE;
+        updateBlink();
     }
 
     // --------------------------------------------------------
-    // Update animation
+    // Render OLED
     // --------------------------------------------------------
-
-    updateBlink();
 
     if (now - lastFrameMillis >= FRAME_INTERVAL)
     {
