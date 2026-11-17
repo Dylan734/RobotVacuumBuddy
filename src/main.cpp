@@ -1,4 +1,4 @@
-
+// RobotVacuumBuddy uses a esp32c3 a LSM6DS3 IMU and a SH1106 OLED to animate a character on the oled.
 #include <Arduino.h>
 #include <Wire.h>
 #include <U8g2lib.h>
