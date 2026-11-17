@@ -38,6 +38,8 @@
 
 #define IMU_ADDRESS 0x6B
 
+// Debug overlay
+#define DEBUG_MODE 0
 #define SERIAL_DEBUG 0
 
 // BOOT button
@@ -61,7 +63,7 @@
 #define TURN_RELEASE_THRESHOLD 12.0f
 
 // Bump detection (g)
-#define BUMP_THRESHOLD_G 0.35f
+#define BUMP_THRESHOLD_G 0.20f
 
 // Pickup detection
 #define PICKUP_TILT_THRESHOLD 40.0f
@@ -81,7 +83,7 @@
 #define INACTIVITY_TIMEOUT 180000UL
 
 // Sleep animation before OLED turns off
-#define SLEEP_TRANSITION_DURATION 1800UL
+#define SLEEP_TRANSITION_DURATION 20000UL
 
 // Movement detection thresholds
 #define MOVEMENT_ACCEL_THRESHOLD 0.10f
@@ -259,7 +261,7 @@ unsigned long calibrationStartMillis = 0;
 // ============================================================
 // STATE FLAGS
 // ============================================================
-
+bool movementDetected = false;
 bool pickedUp = false;
 bool turning = false;
 
@@ -400,7 +402,10 @@ void detectMovement()
     bool rotationDetected =
         gyroMagnitude > MOVEMENT_GYRO_THRESHOLD;
 
-    if (accelerationDetected || rotationDetected)
+    movementDetected =
+        accelerationDetected || rotationDetected;
+
+    if (movementDetected)
     {
         lastMovementMillis = millis();
 
@@ -416,6 +421,102 @@ void detectMovement()
     }
 }
 
+
+//
+// ============================================================
+// DEBUG OVERLAY
+// ============================================================
+
+const char* getMovementLabel()
+{
+    unsigned long now = millis();
+
+    if (pickedUp)
+        return "PICKUP";
+
+    if (turning)
+    {
+        return (turnDirection > 0)
+            ? "TURN-R"
+            : "TURN-L";
+    }
+
+    if (lastBumpMillis != 0 &&
+        now - lastBumpMillis < BUMP_DURATION)
+    {
+        return "BUMP";
+    }
+
+    if (movementDetected)
+        return "MOVE";
+
+    return "IDLE";
+}
+
+
+const char* getExpressionLabel()
+{
+    switch (mood)
+    {
+        case MOOD_IDLE:
+            return "HAPPY";
+
+        case MOOD_TURN_LEFT:
+            return "TURN-L";
+
+        case MOOD_TURN_RIGHT:
+            return "TURN-R";
+
+        case MOOD_BUMP:
+            return "SURPRISE";
+
+        case MOOD_PICKED_UP:
+            return "EXCITED";
+
+        case MOOD_DIZZY:
+            return "DIZZY";
+
+        case MOOD_SLEEPY:
+            return "SLEEPY";
+
+        case MOOD_SLEEPING:
+            return "SLEEPING";
+
+        case MOOD_ANNOYED:
+            return "ANNOYED";
+
+        case MOOD_CURIOUS:
+            return "CURIOUS";
+
+        default:
+            return "UNKNOWN";
+    }
+}
+
+
+void drawDebugOverlay()
+{
+    #if DEBUG_MODE
+
+    char debugText[32];
+
+    snprintf(
+        debugText,
+        sizeof(debugText),
+        "M:%s E:%s",
+        getMovementLabel(),
+        getExpressionLabel()
+    );
+
+    // Smallest practical font for the bottom edge
+    u8g2.setFont(u8g2_font_4x6_tr);
+
+    // Baseline at the bottom of the OLED.
+    // Existing facial features remain untouched.
+    u8g2.drawStr(0, 63, debugText);
+
+    #endif
+}
 
 // ============================================================
 // IMU SAMPLING
@@ -1358,6 +1459,9 @@ void drawFace()
     {
         drawCuriousFace();
     }
+
+    // Debug information along the bottom edge
+    drawDebugOverlay();
 
     u8g2.sendBuffer();
 }
