@@ -18,6 +18,14 @@
 // SCL = GPIO7
 // OLED = 0x3C
 // IMU  = 0x6B
+//
+// BOOT BUTTON:
+// GPIO9, active LOW
+//
+// BUTTON:
+// Short press = Next expression
+// Hold 3 seconds = Automatic expression demo
+// 8 seconds without another short press = Return to normal
 // ============================================================
 
 
@@ -31,6 +39,15 @@
 #define IMU_ADDRESS 0x6B
 
 #define SERIAL_DEBUG 0
+
+// BOOT button
+#define BOOT_BUTTON_PIN 9
+#define BUTTON_DEBOUNCE_TIME 35UL
+#define LONG_PRESS_TIME 3000UL
+
+// Expression demo
+#define DEMO_EXPRESSION_DURATION 1500UL
+#define MANUAL_PREVIEW_TIMEOUT 8000UL
 
 // IMU sampling
 #define SAMPLE_INTERVAL 20UL
@@ -52,7 +69,7 @@
 
 // Timing
 #define BUMP_COOLDOWN 1200UL
-#define BUMP_DURATION 900UL
+#define BUMP_DURATION 1800UL
 
 #define PICKUP_CONFIRM_TIME 300UL
 #define PICKUP_RELEASE_TIME 800UL
@@ -114,6 +131,42 @@ FaceMood mood = MOOD_IDLE;
 
 
 // ============================================================
+// EXPRESSION DEMO STATES
+// ============================================================
+
+enum DemoMode
+{
+    DEMO_NONE,
+    DEMO_MANUAL,
+    DEMO_AUTOMATIC
+};
+
+DemoMode demoMode = DEMO_NONE;
+
+const FaceMood demoExpressions[] =
+{
+    MOOD_IDLE,
+    MOOD_TURN_LEFT,
+    MOOD_TURN_RIGHT,
+    MOOD_BUMP,
+    MOOD_PICKED_UP,
+    MOOD_DIZZY,
+    MOOD_SLEEPY,
+    MOOD_SLEEPING,
+    MOOD_ANNOYED,
+    MOOD_CURIOUS
+};
+
+const int DEMO_EXPRESSION_COUNT =
+    sizeof(demoExpressions) / sizeof(demoExpressions[0]);
+
+int demoIndex = 0;
+
+unsigned long demoStepMillis = 0;
+unsigned long lastManualPressMillis = 0;
+
+
+// ============================================================
 // TIMERS
 // ============================================================
 
@@ -137,6 +190,19 @@ unsigned long sleepTransitionStart = 0;
 
 unsigned long bumpWindowStart = 0;
 unsigned long nextCuriousMillis = 0;
+
+
+// ============================================================
+// BOOT BUTTON STATE
+// ============================================================
+
+bool buttonRawState = HIGH;
+bool buttonStableState = HIGH;
+
+unsigned long buttonDebounceMillis = 0;
+unsigned long buttonPressStartMillis = 0;
+
+bool longPressTriggered = false;
 
 
 // ============================================================
@@ -338,13 +404,11 @@ void detectMovement()
     {
         lastMovementMillis = millis();
 
-        // Wake up if the OLED was switched off
         if (displaySleeping || sleepTransition)
         {
             wakeDisplay();
         }
 
-        // Leave sleepy state when movement resumes
         if (mood == MOOD_SLEEPY)
         {
             mood = MOOD_IDLE;
@@ -457,9 +521,6 @@ void detectPickup()
     }
     else
     {
-        // Release only after returning close
-        // to the original orientation.
-
         if (tilt < PICKUP_RELEASE_THRESHOLD &&
             accelMagnitude > 0.85f &&
             accelMagnitude < 1.15f)
@@ -603,6 +664,10 @@ void updateSensors()
 
     detectMovement();
 
+    // Do not allow sensor events to interrupt demo
+    if (demoMode != DEMO_NONE)
+        return;
+
     detectPickup();
 
     if (pickedUp)
@@ -621,6 +686,10 @@ void updateSensors()
 void updatePowerSaving()
 {
     if (!calibrated)
+        return;
+
+    // Do not enter sleep during expression demo
+    if (demoMode != DEMO_NONE)
         return;
 
     if (pickedUp || turning)
@@ -644,7 +713,6 @@ void updatePowerSaving()
 
             mood = MOOD_SLEEPING;
 
-            // Allow the Z animation to begin
             lastFrameMillis = 0;
         }
 
@@ -680,6 +748,9 @@ void updatePowerSaving()
 
 void updateTimedExpressions()
 {
+    if (demoMode != DEMO_NONE)
+        return;
+
     unsigned long now = millis();
 
     // End temporary expressions
@@ -718,6 +789,189 @@ void updateTimedExpressions()
 
         nextCuriousMillis =
             now + random(20000, 40000);
+    }
+}
+
+
+// ============================================================
+// EXPRESSION DEMO CONTROL
+// ============================================================
+
+void endExpressionDemo()
+{
+    demoMode = DEMO_NONE;
+
+    demoIndex = 0;
+
+    mood = MOOD_IDLE;
+
+    lastMovementMillis = millis();
+
+    blinkUntil = 0;
+    nextBlinkMillis = millis() + 2500;
+
+    moodUntil = 0;
+
+    sleepTransition = false;
+
+    lastFrameMillis = 0;
+}
+
+
+void startAutomaticDemo()
+{
+    wakeDisplay();
+
+    demoMode = DEMO_AUTOMATIC;
+
+    demoIndex = 0;
+
+    mood = demoExpressions[demoIndex];
+
+    demoStepMillis = millis();
+
+    sleepTransition = false;
+
+    lastMovementMillis = millis();
+
+    lastFrameMillis = 0;
+}
+
+
+void advanceManualDemo()
+{
+    wakeDisplay();
+
+    if (demoMode != DEMO_MANUAL)
+    {
+        demoMode = DEMO_MANUAL;
+
+        demoIndex = 0;
+    }
+    else
+    {
+        demoIndex++;
+
+        if (demoIndex >= DEMO_EXPRESSION_COUNT)
+        {
+            demoIndex = 0;
+        }
+    }
+
+    mood = demoExpressions[demoIndex];
+
+    lastManualPressMillis = millis();
+
+    lastMovementMillis = millis();
+
+    sleepTransition = false;
+
+    lastFrameMillis = 0;
+}
+
+
+void updateExpressionDemo()
+{
+    unsigned long now = millis();
+
+    // --------------------------------------------------------
+    // Manual preview timeout
+    // --------------------------------------------------------
+
+    if (demoMode == DEMO_MANUAL)
+    {
+        if (now - lastManualPressMillis >=
+            MANUAL_PREVIEW_TIMEOUT)
+        {
+            endExpressionDemo();
+        }
+
+        return;
+    }
+
+    // --------------------------------------------------------
+    // Automatic demonstration
+    // --------------------------------------------------------
+
+    if (demoMode == DEMO_AUTOMATIC)
+    {
+        if (now - demoStepMillis >=
+            DEMO_EXPRESSION_DURATION)
+        {
+            demoStepMillis = now;
+
+            demoIndex++;
+
+            if (demoIndex >= DEMO_EXPRESSION_COUNT)
+            {
+                endExpressionDemo();
+                return;
+            }
+
+            mood = demoExpressions[demoIndex];
+
+            lastFrameMillis = 0;
+        }
+    }
+}
+
+
+// ============================================================
+// BOOT BUTTON HANDLING
+// ============================================================
+
+void updateBootButton()
+{
+    unsigned long now = millis();
+
+    bool reading = digitalRead(BOOT_BUTTON_PIN);
+
+    // Detect raw state changes
+    if (reading != buttonRawState)
+    {
+        buttonRawState = reading;
+
+        buttonDebounceMillis = now;
+    }
+
+    // Apply debounce
+    if (now - buttonDebounceMillis >=
+        BUTTON_DEBOUNCE_TIME)
+    {
+        if (buttonStableState != buttonRawState)
+        {
+            buttonStableState = buttonRawState;
+
+            // Button pressed
+            if (buttonStableState == LOW)
+            {
+                buttonPressStartMillis = now;
+
+                longPressTriggered = false;
+            }
+
+            // Button released
+            else
+            {
+                if (!longPressTriggered)
+                {
+                    advanceManualDemo();
+                }
+            }
+        }
+    }
+
+    // Long press detection
+    if (buttonStableState == LOW &&
+        !longPressTriggered)
+    {
+        if (now - buttonPressStartMillis >=
+            LONG_PRESS_TIME)
+        {
+            longPressTriggered = true;
+
+            startAutomaticDemo();
+        }
     }
 }
 
@@ -839,13 +1093,9 @@ void drawClosedEyes()
 
 void drawSleepyEyes()
 {
-    // Same rectangular eye design,
-    // partially closed from the top.
-
     u8g2.drawRBox(34, 30, 22, 12, 5);
     u8g2.drawRBox(72, 30, 22, 12, 5);
 
-    // Eyelid lines
     u8g2.drawLine(34, 30, 56, 30);
     u8g2.drawLine(72, 30, 94, 30);
 }
@@ -857,9 +1107,6 @@ void drawSleepyEyes()
 
 void drawSurprisedFace()
 {
-    // Keep the original rectangular eyes.
-    // Make them taller to show surprise.
-
     drawEyes(
         33,
         71,
@@ -868,7 +1115,6 @@ void drawSurprisedFace()
         32
     );
 
-    // Raised eyebrows
     u8g2.drawLine(34, 7, 45, 4);
     u8g2.drawLine(83, 4, 94, 7);
 
@@ -890,13 +1136,11 @@ void drawExcitedFace()
         29
     );
 
-    // Happy eyebrows
     u8g2.drawLine(35, 9, 46, 5);
     u8g2.drawLine(82, 5, 93, 9);
 
     drawBigSmile();
 
-    // Small excitement marks
     u8g2.drawLine(21, 18, 17, 14);
     u8g2.drawLine(107, 18, 111, 14);
 }
@@ -908,7 +1152,6 @@ void drawExcitedFace()
 
 void drawDizzyFace()
 {
-    // Keep rectangular eye outlines.
     drawEyes(
         34,
         72,
@@ -917,7 +1160,6 @@ void drawDizzyFace()
         26
     );
 
-    // Cross-shaped pupils
     u8g2.setDrawColor(0);
 
     u8g2.drawLine(39, 24, 51, 36);
@@ -930,7 +1172,6 @@ void drawDizzyFace()
 
     drawSurprisedMouth();
 
-    // Animated dizzy marks
     unsigned long phase = millis() / 180;
 
     int offset = (phase % 2 == 0) ? 0 : 3;
@@ -955,7 +1196,6 @@ void drawAnnoyedFace()
         24
     );
 
-    // Angry eyebrows
     u8g2.drawLine(32, 12, 56, 20);
     u8g2.drawLine(72, 20, 96, 12);
 
@@ -973,7 +1213,6 @@ void drawCuriousFace()
 
     int offset = (phase % 2 == 0) ? 3 : 0;
 
-    // Eyes shift slightly to the right.
     drawEyes(
         34 + offset,
         72 + offset,
@@ -982,10 +1221,7 @@ void drawCuriousFace()
         26
     );
 
-    // One raised eyebrow
     u8g2.drawLine(34, 8, 48, 5);
-
-    // Other eyebrow raised differently
     u8g2.drawLine(78, 7, 94, 12);
 
     drawFlatMouth();
@@ -1002,7 +1238,6 @@ void drawSleepingFace()
 
     drawFlatMouth();
 
-    // Animated Zs
     unsigned long phase = millis() / 350;
 
     int x = 88 - (phase % 3) * 4;
@@ -1028,10 +1263,7 @@ void drawFace()
     bool blink =
         (blinkUntil != 0 && now < blinkUntil);
 
-    // --------------------------------------------------------
     // Normal / happy
-    // --------------------------------------------------------
-
     if (mood == MOOD_IDLE)
     {
         if (blink)
@@ -1052,10 +1284,7 @@ void drawFace()
         drawSmile();
     }
 
-    // --------------------------------------------------------
     // Turning left
-    // --------------------------------------------------------
-
     else if (mood == MOOD_TURN_LEFT)
     {
         drawEyes(
@@ -1069,10 +1298,7 @@ void drawFace()
         drawSmile();
     }
 
-    // --------------------------------------------------------
     // Turning right
-    // --------------------------------------------------------
-
     else if (mood == MOOD_TURN_RIGHT)
     {
         drawEyes(
@@ -1086,37 +1312,25 @@ void drawFace()
         drawSmile();
     }
 
-    // --------------------------------------------------------
     // Surprised / bump
-    // --------------------------------------------------------
-
     else if (mood == MOOD_BUMP)
     {
         drawSurprisedFace();
     }
 
-    // --------------------------------------------------------
     // Excited / picked up
-    // --------------------------------------------------------
-
     else if (mood == MOOD_PICKED_UP)
     {
         drawExcitedFace();
     }
 
-    // --------------------------------------------------------
     // Dizzy
-    // --------------------------------------------------------
-
     else if (mood == MOOD_DIZZY)
     {
         drawDizzyFace();
     }
 
-    // --------------------------------------------------------
     // Sleepy
-    // --------------------------------------------------------
-
     else if (mood == MOOD_SLEEPY)
     {
         drawSleepyEyes();
@@ -1127,28 +1341,19 @@ void drawFace()
         u8g2.drawStr(96, 17, "z");
     }
 
-    // --------------------------------------------------------
     // Sleeping
-    // --------------------------------------------------------
-
     else if (mood == MOOD_SLEEPING)
     {
         drawSleepingFace();
     }
 
-    // --------------------------------------------------------
     // Annoyed
-    // --------------------------------------------------------
-
     else if (mood == MOOD_ANNOYED)
     {
         drawAnnoyedFace();
     }
 
-    // --------------------------------------------------------
     // Curious
-    // --------------------------------------------------------
-
     else if (mood == MOOD_CURIOUS)
     {
         drawCuriousFace();
@@ -1199,6 +1404,11 @@ void setup()
     #endif
 
     randomSeed(micros());
+
+    pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+
+    buttonRawState = digitalRead(BOOT_BUTTON_PIN);
+    buttonStableState = buttonRawState;
 
     Wire.begin(I2C_SDA, I2C_SCL);
     Wire.setClock(100000);
@@ -1289,12 +1499,23 @@ void loop()
     }
 
     // --------------------------------------------------------
+    // BOOT button
+    // --------------------------------------------------------
+
+    updateBootButton();
+
+    // --------------------------------------------------------
+    // Expression demonstration
+    // --------------------------------------------------------
+
+    updateExpressionDemo();
+
+    // --------------------------------------------------------
     // Power saving and inactivity
     // --------------------------------------------------------
 
     updatePowerSaving();
 
-    // Do not render while OLED is switched off
     if (displaySleeping)
         return;
 
